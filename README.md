@@ -15,7 +15,6 @@ Robot Control and Autonomous Navigation System for the Robot Programming Competi
 | 1 | Nou Srey Oun (នូ ស្រីអូន) | Team Leader & Project Manager | គ្រប់គ្រងគម្រោងទូទៅ សម្របសម្រួលក្រុម និងយុទ្ធសាស្ត្រប្រកួត | Team Leader |
 | 2 | Korb Sameth (កប សាម៉េត) | Lead Programmer (Me) | សរសេរ main.py, រៀបចំ System Architecture និងសម្របសម្រួល Code | [@korbsameth](https://github.com/korbsameth) |
 | 3 | លី លីអ៊ីញ (Ly Ly Inh) | Vision & AR Marker Dev | អភិវឌ្ឍន៍ marker_reader.py, ស្កេន និងចាប់ទិន្នន័យពី AR Marker | Member |
-| 4 | ប៊ុនណា លីដា (Bunna Lida) | Motion & Hardware Controller | អភិវឌ្ឍន៍ movement.py, បញ្ជា Motor និង route_planner.py | Member |
 
 ---
 
@@ -67,5 +66,4 @@ python code/main.py
 ## Git & Version Control
 
 - Repository: https://github.com/korbsameth/kibo-PRC
-- Lead Programmer: Korb Sameth ([@korbsameth](https://github.com/korbsameth))
 - Team Leader: Nou Srey Oun
