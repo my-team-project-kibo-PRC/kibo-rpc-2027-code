@@ -15,39 +15,95 @@ from ib2_msgs.msg import CtlCommandAction, CtlCommandGoal, CtlCommandResult, Ctl
 from ib2_msgs.msg import Navigation
 
 
-# ---- time model (calibrated from Web simulator runs, simulation seconds) ----
-HOP_BASE = 21.0      # fixed seconds per move (acceleration, deceleration, settling)
-HOP_PER_M = 5.7      # seconds per metre
-START_EXTRA = 6.0    # extra time of the very first move
+# ---- time model (fitted on 29 hops of Web simulator runs, simulation seconds) ----
+# time until the robot is inside the Lv3 limits after a move command:
+#   -1.27 + 29.67*sqrt(d) - 4.61*d + 0.028*theta      (d = metres, theta = rotation in degrees)
+# the robot first translates, then rotates; error of this model is about 1.5 s per move.
+HOP_A = -1.27
+HOP_SQRT = 29.67
+HOP_LIN = -4.61
+HOP_ROT = 0.028
+HOP_MIN_D = 0.15     # very short moves: the fit is not valid below this distance
+HOP_EXTRA = 1.8      # seconds between "inside Lv3 limits" and "move result"
+HOP_SCALE = 1.0     # v13: no extra safety factor (est was within 1.5% on Easy runs)
+START_EXTRA = 8.0    # seconds of the mission clock before the first move starts
+DEFAULT_ROT = 120.0  # rotation to assume when the start attitude is unknown
 SETTLE = 0.3         # wait before notifying a normal checkpoint
 GOAL_SETTLE = 0.5    # wait before notifying the goal
-PLAN_LIMIT = 255.0
-PLAN_LIMIT_ALL = 282.0
-MOVE_TRIES = 3
-REFINE_LIMIT = 18.0   # re-send the move when (att_err + 114.6*pos_err) is above this (deg)
+PLAN_LIMIT = 275.0       # plan B (no goal): estimated finish limit
+PLAN_LIMIT_ALL = 290.0   # plan A (all checkpoints + goal): estimated finish limit
+MOVE_TRIES = 3       # total attempts per checkpoint when the move result is not success
+GUARD_LIMIT = 286.0  # run-time guard: never plan to finish later than this
+MISSION_T0 = 7.0     # simulation clock when the mission starts (about 7 s)
+
+# The attitude controller ignores small rotations (seen at 20, 23 and 26 degrees).
+# The planner therefore avoids hops that need a rotation in this range.
+# Centering levels: Lv3 <= 10 deg, Lv2 <= 20 deg, Lv1 <= 30 deg.
+STUCK_LO = 12.0
+STUCK_MID = 20.0
+STUCK_HI = 31.0
+STUCK_PEN_LV2 = 7.0   # seconds-equivalent of losing Lv3 -> Lv2 (rotation 12..20 deg)
+STUCK_PEN_LV1 = 17.0  # seconds-equivalent of losing Lv3 -> Lv1 (rotation 20..31 deg)
+
+REFINE_LIMIT = 18.0   # act when (att_err + 114.6*pos_err) is above this (deg)
 REFINE_WAIT = 2.0     # seconds to wait first, the robot may still be rotating
 REFINE_COST = 15.0    # estimated seconds of one extra move
-GUARD_LIMIT = 288.0  # run-time guard: never plan to finish later than this
-HOP_SCALE = 1.08     # safety factor (Hard runs were ~8% slower than the model)
-MISSION_T0 = 7.0     # simulation clock when the mission starts (about 7 s)
+LV2_ANGLE = 20.0      # centering limit of Lv2
+EXTRA_WAIT = 3.0      # extra seconds to wait when the attitude error is 20..30 deg
+UNSTICK_MIN = 30.0    # unstick only when the attitude error is at least this (Fail risk)
+UNSTICK_ANGLE = 90.0  # go through a pose rotated by this angle, then to the target
+UNSTICK_COST = 32.0   # estimated seconds of the two extra moves
+
+CONV_LIMIT = 6.0      # v13: wait until (att_err + 114.6*pos_err) is below this (deg)
+CONV_WAIT = 3.0       # v13: wait at most this many seconds for it
 
 
 def _dist(a, b):
     return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
 
-def _hop(a, b):
-    return HOP_SCALE * (HOP_BASE + HOP_PER_M * _dist(a, b))
+def _pose(c):
+    return (c['position'], c['quaternion'])
 
 
-def _est_time(start, order, goal_pos):
+def _ang(q1, q2):
+    if q1 is None or q2 is None:
+        return DEFAULT_ROT
+    dot = abs(sum(x * y for x, y in zip(q1, q2)))
+    return math.degrees(2.0 * math.acos(min(1.0, dot)))
+
+
+def _qmul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return [aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz]
+
+
+def _hop(a, b, plan=False):
+    """Estimated seconds for a move from pose a to pose b (pose = (position, quaternion))."""
+    d = max(_dist(a[0], b[0]), HOP_MIN_D)
+    th = _ang(a[1], b[1])
+    t = HOP_A + HOP_SQRT * math.sqrt(d) + HOP_LIN * d + HOP_ROT * th
+    t = HOP_SCALE * (t + HOP_EXTRA)
+    if plan:
+        if STUCK_LO < th <= STUCK_MID:
+            t += STUCK_PEN_LV2
+        elif STUCK_MID < th <= STUCK_HI:
+            t += STUCK_PEN_LV1
+    return t
+
+
+def _est_time(start, order, goal):
     t = START_EXTRA
     cur = start
     for c in order:
-        t += _hop(cur, c['position']) + SETTLE
-        cur = c['position']
-    if goal_pos is not None:
-        t += _hop(cur, goal_pos) + GOAL_SETTLE
+        t += _hop(cur, _pose(c)) + SETTLE
+        cur = _pose(c)
+    if goal is not None:
+        t += _hop(cur, goal) + GOAL_SETTLE
     return t
 
 
@@ -58,19 +114,20 @@ def _score(n_checkpoints, t, has_goal, limit):
     return raw * max(1.0, 2.0 - t / 300.0)
 
 
-def _best_order(start, cps, goal_pos):
-    """Shortest path start -> all cps -> goal (exact for <= 9 points)."""
+def _best_order(start, cps, goal):
+    """Cheapest path start -> all cps -> goal (exact for <= 12 points), cost = estimated time."""
     n = len(cps)
     if n <= 1:
         return list(cps)
-    pos = [c['position'] for c in cps]
+    poses = [_pose(c) for c in cps]
     if n <= 12:
         INF = float('inf')
         full = (1 << n) - 1
+        cost = [[_hop(poses[j], poses[k], True) + SETTLE for k in range(n)] for j in range(n)]
         dp = [[INF] * n for _ in range(full + 1)]
         par = [[-1] * n for _ in range(full + 1)]
         for j in range(n):
-            dp[1 << j][j] = _dist(start, pos[j])
+            dp[1 << j][j] = _hop(start, poses[j], True)
         for mask in range(1, full + 1):
             for j in range(n):
                 if dp[mask][j] == INF or not (mask >> j) & 1:
@@ -79,13 +136,13 @@ def _best_order(start, cps, goal_pos):
                     if (mask >> k) & 1:
                         continue
                     nm = mask | (1 << k)
-                    d = dp[mask][j] + _dist(pos[j], pos[k])
+                    d = dp[mask][j] + cost[j][k]
                     if d < dp[nm][k]:
                         dp[nm][k] = d
                         par[nm][k] = j
         best_j, best_d = 0, INF
         for j in range(n):
-            d = dp[full][j] + (_dist(pos[j], goal_pos) if goal_pos is not None else 0.0)
+            d = dp[full][j] + (_hop(poses[j], goal, True) if goal is not None else 0.0)
             if d < best_d:
                 best_j, best_d = j, d
         seq = []
@@ -102,23 +159,23 @@ def _best_order(start, cps, goal_pos):
     order = []
     cur = start
     while rest:
-        nxt = min(rest, key=lambda c: _dist(c['position'], cur))
+        nxt = min(rest, key=lambda c: _hop(cur, _pose(c), True))
         rest.remove(nxt)
         order.append(nxt)
-        cur = nxt['position']
+        cur = _pose(nxt)
     return order
 
 
-def _prune(start, order, goal_pos, with_goal_bonus, limit):
+def _prune(start, order, goal, with_goal_bonus, limit):
     """Drop checkpoints one by one while that raises the score (or fixes the time limit)."""
     skipped = []
     while order:
-        cur_t = _est_time(start, order, goal_pos)
+        cur_t = _est_time(start, order, goal)
         cur_s = _score(len(order), cur_t, with_goal_bonus, limit)
         best = None
         for i in range(len(order)):
             sub = order[:i] + order[i + 1:]
-            t = _est_time(start, sub, goal_pos)
+            t = _est_time(start, sub, goal)
             sc = _score(len(sub), t, with_goal_bonus, limit)
             if best is None or (sc, -t) > (best[0], -best[1]):
                 best = (sc, t, i)
@@ -131,7 +188,7 @@ def _prune(start, order, goal_pos, with_goal_bonus, limit):
 
 
 def plan_route(checkpoints, goal_id, start):
-    """Return (route, skipped, with_goal).
+    """Return (route, skipped, with_goal). start = (position, quaternion or None).
 
     The judge gives the goal bonus (+30) only when EVERY checkpoint was passed
     ("goal: checkpoints not passed: ..." in result.json). So there are two plans:
@@ -148,9 +205,9 @@ def plan_route(checkpoints, goal_id, start):
     plan_a = None
     if goal_cp is not None:
         rest = [c for c in cps if c is not goal_cp]
-        goal_pos = goal_cp['position']
-        order_a = _best_order(start, rest, goal_pos)
-        t_a = _est_time(start, order_a, goal_pos)
+        goal = _pose(goal_cp)
+        order_a = _best_order(start, rest, goal)
+        t_a = _est_time(start, order_a, goal)
         s_a = _score(len(cps) - 1, t_a, True, PLAN_LIMIT_ALL)
         plan_a = (s_a, order_a + [goal_cp], t_a)
     order_b = _best_order(start, cps, None)
@@ -168,13 +225,13 @@ def plan_route(checkpoints, goal_id, start):
     return order_b, skipped_b, False
 
 
-def should_skip(elapsed, cur_pos, cp_pos, goal_pos):
-    """Run-time guard: skip a checkpoint if we could not finish in time."""
+def should_skip(elapsed, cur, cp, goal):
+    """Run-time guard: skip a checkpoint if we could not finish in time (poses, not positions)."""
     if elapsed is None:
         return False
-    need = _hop(cur_pos, cp_pos) + SETTLE
-    if goal_pos is not None:
-        need += _hop(cp_pos, goal_pos) + GOAL_SETTLE
+    need = _hop(cur, cp) + SETTLE
+    if goal is not None:
+        need += _hop(cp, goal) + GOAL_SETTLE
     return elapsed + need > GUARD_LIMIT
 
 
@@ -315,14 +372,32 @@ class UserTemplate:
         ang = math.degrees(2.0 * math.acos(min(1.0, dot)))
         return perr, ang
 
-    def __refine(self, cp, allowed):
+    def __converge(self, cp):
+        """v13: when the pose is nearly (but not yet) inside Lv3, wait a little for it to settle.
+        Skipped for the stuck range (12..40 deg): waiting does not help there."""
+        err = self.__pose_error(cp)
+        if err is None or err[1] > STUCK_LO:
+            return
+        if err[1] + 114.6 * err[0] <= CONV_LIMIT:
+            return
+        waited = 0.0
+        while waited < CONV_WAIT and not rospy.is_shutdown():
+            rospy.sleep(0.2)
+            waited += 0.2
+            err = self.__pose_error(cp)
+            if err is None or err[1] > STUCK_LO or err[1] + 114.6 * err[0] <= CONV_LIMIT:
+                break
+        rospy.loginfo('CONVERGE cp=%d waited=%.1f', cp['checkpoint_id'], waited)
+
+    def __refine(self, cp, slack):
         """If the robot is clearly off the target pose (a Fail would also cost the goal),
-        wait a little, then send the move again. Returns True when a move was re-sent."""
+        wait a little, then correct it. slack = seconds left before GUARD_LIMIT.
+        Returns True when a move was sent."""
         err = self.__pose_error(cp)
         if err is None or err[1] + 114.6 * err[0] <= REFINE_LIMIT:
             return False
-        rospy.logwarn('REFINE cp=%d pos_err=%.3f att_err=%.1f allowed=%s',
-                      cp['checkpoint_id'], err[0], err[1], allowed)
+        rospy.logwarn('REFINE cp=%d pos_err=%.3f att_err=%.1f slack=%.1f',
+                      cp['checkpoint_id'], err[0], err[1], slack)
         for _ in range(int(REFINE_WAIT / 0.2)):
             if rospy.is_shutdown():
                 return False
@@ -331,12 +406,49 @@ class UserTemplate:
             if err is not None and err[1] + 114.6 * err[0] <= REFINE_LIMIT:
                 rospy.loginfo('REFINE cp=%d settled by waiting', cp['checkpoint_id'])
                 return False
-        if not allowed:
+        if err is None:
+            return False
+        if err[0] < 0.1 and STUCK_LO < err[1] <= 40.0:
+            # small rotation ignored by the controller: sending the same target again does nothing
+            if err[1] <= LV2_ANGLE:
+                rospy.loginfo('REFINE cp=%d attitude %.1f deg accepted (Lv2)', cp['checkpoint_id'], err[1])
+                return False
+            if err[1] < UNSTICK_MIN:
+                # Lv1 only (no Fail): the controller may still creep, wait a bit for Lv2
+                for _ in range(int(EXTRA_WAIT / 0.2)):
+                    if rospy.is_shutdown():
+                        return False
+                    rospy.sleep(0.2)
+                    err = self.__pose_error(cp)
+                    if err is None or err[1] <= LV2_ANGLE:
+                        break
+                if err is not None:
+                    rospy.loginfo('REFINE cp=%d attitude %.1f deg accepted (%s)', cp['checkpoint_id'], err[1],
+                                  'Lv2' if err[1] <= LV2_ANGLE else 'Lv1')
+                return False
+            if slack < UNSTICK_COST:
+                rospy.logwarn('UNSTICK cp=%d skipped (no time)', cp['checkpoint_id'])
+                return False
+            self.__unstick(cp)
+            return True
+        if slack < REFINE_COST:
             rospy.logwarn('REFINE cp=%d skipped (no time)', cp['checkpoint_id'])
             return False
         self.__move_to_checkpoint(cp)
         rospy.sleep(SETTLE)
         return True
+
+    def __unstick(self, cp):
+        """Rotate to a pose far from the target (a big rotation is executed), then rotate back."""
+        h = math.radians(UNSTICK_ANGLE) / 2.0
+        qm = _qmul(cp['quaternion'], [math.sin(h), 0.0, 0.0, math.cos(h)])
+        n = math.sqrt(sum(v * v for v in qm)) or 1.0
+        mid = {'checkpoint_id': cp['checkpoint_id'], 'position': cp['position'],
+               'quaternion': [v / n for v in qm]}
+        rospy.logwarn('UNSTICK cp=%d via %.0f deg pose', cp['checkpoint_id'], UNSTICK_ANGLE)
+        self.__move_to_checkpoint(mid)
+        self.__move_to_checkpoint(cp)
+        rospy.sleep(SETTLE)
 
     def __log_error(self, cp):
         try:
@@ -359,10 +471,11 @@ class UserTemplate:
             checkpoints, goal_id = self.__load_checkpoints()
             if not checkpoints:
                 rospy.logerr('no checkpoints, finishing')
-            start = self.__current_position if self.__current_position else (
+            start_pos = self.__current_position if self.__current_position else (
                 checkpoints[0]['position'] if checkpoints else [0.0, 0.0, 0.0])
+            start = (start_pos, self.__current_orientation)
             route, skipped, with_goal = plan_route(checkpoints, goal_id, start)
-            goal_pos = route[-1]['position'] if with_goal else None
+            goal_pos = _pose(route[-1]) if with_goal else None
             rospy.loginfo('goal_id=%s with_goal=%s route=%s planned_skip=%s est_time=%.1f',
                           goal_id, with_goal, [c['checkpoint_id'] for c in route], skipped,
                           _est_time(start, route[:-1] if with_goal else route, goal_pos))
@@ -373,29 +486,32 @@ class UserTemplate:
                 if rospy.is_shutdown():
                     return
                 is_goal = with_goal and (cp is route[-1])
-                if not is_goal and should_skip(elapsed, cur_pos, cp['position'], goal_pos):
+                if not is_goal and should_skip(elapsed, cur_pos, _pose(cp), goal_pos):
                     rospy.logwarn('GUARD skip checkpoint %d (elapsed=%.1f)', cp['checkpoint_id'], elapsed)
                     continue
                 reached = self.__move_to_checkpoint(cp)
                 tries = 1
                 while not reached and tries < MOVE_TRIES and not rospy.is_shutdown():
-                    rospy.logwarn('move to checkpoint %d failed (try %d), retrying', cp['checkpoint_id'], tries)
+                    rospy.logwarn('move to checkpoint %d failed (try %d), retrying',
+                                  cp['checkpoint_id'], tries)
                     reached = self.__move_to_checkpoint(cp)
                     tries += 1
                 if not reached:
-                    rospy.logwarn('move to checkpoint %d failed after %d tries, notifying anyway', cp['checkpoint_id'], tries)
+                    rospy.logwarn('move to checkpoint %d failed after %d tries, notifying anyway',
+                                  cp['checkpoint_id'], tries)
                 if self.__last_stamp is not None and self.__last_stamp > 0:
                     elapsed = self.__last_stamp - MISSION_T0
-                cur_pos = cp['position']
+                cur_pos = _pose(cp)
                 rospy.sleep(GOAL_SETTLE if is_goal else SETTLE)
+                self.__converge(cp)
                 rest = route[idx + 1:]
                 if not rest:
                     rem = 0.0
                 elif with_goal:
-                    rem = _est_time(cp['position'], rest[:-1], rest[-1]['position']) - START_EXTRA
+                    rem = _est_time(_pose(cp), rest[:-1], _pose(rest[-1])) - START_EXTRA
                 else:
-                    rem = _est_time(cp['position'], rest, None) - START_EXTRA
-                if self.__refine(cp, elapsed + REFINE_COST + rem <= GUARD_LIMIT):
+                    rem = _est_time(_pose(cp), rest, None) - START_EXTRA
+                if self.__refine(cp, GUARD_LIMIT - (elapsed + rem)):
                     if self.__last_stamp is not None and self.__last_stamp > 0:
                         elapsed = self.__last_stamp - MISSION_T0
                 self.__log_error(cp)
